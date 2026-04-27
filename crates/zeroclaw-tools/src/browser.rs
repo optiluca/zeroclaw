@@ -1480,6 +1480,20 @@ mod native_backend {
             let mut chrome_options: Map<String, Value> = Map::new();
             let mut args: Vec<Value> = Vec::new();
 
+            // Prevent Chrome from throttling timers/renderers in background tabs —
+            // critical for JS-heavy SPAs that rely on timers after navigation.
+            for flag in &[
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
+                "--disable-popup-blocking",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--password-store=basic",
+            ] {
+                args.push(Value::String((*flag).to_string()));
+            }
+
             if headless {
                 args.push(Value::String("--headless=new".to_string()));
                 args.push(Value::String("--disable-gpu".to_string()));
@@ -1493,9 +1507,7 @@ mod native_backend {
                 args.push(Value::String("--disable-dev-shm-usage".to_string()));
             }
 
-            if !args.is_empty() {
-                chrome_options.insert("args".to_string(), Value::Array(args));
-            }
+            chrome_options.insert("args".to_string(), Value::Array(args));
 
             if let Some(path) = chrome_path {
                 let trimmed = path.trim();
@@ -1510,6 +1522,14 @@ mod native_backend {
                     Value::Object(chrome_options),
                 );
             }
+
+            // "eager" returns after DOMContentLoaded rather than waiting for all
+            // sub-resources (images, fonts, analytics). Faster for JS-heavy SPAs;
+            // explicit Wait actions handle remaining async content.
+            capabilities.insert(
+                "pageLoadStrategy".to_string(),
+                Value::String("eager".to_string()),
+            );
 
             let mut builder =
                 ClientBuilder::rustls().context("Failed to initialize rustls connector")?;
@@ -1601,17 +1621,22 @@ mod native_backend {
         client: &Client,
         selector: &str,
     ) -> Result<fantoccini::elements::Element> {
-        let element = match parse_selector(selector) {
+        // Wait up to 10 s for elements to appear — JS-heavy SPAs render
+        // elements asynchronously after the DOM is ready.
+        match parse_selector(selector) {
             SelectorKind::Css(css) => client
-                .find(Locator::Css(&css))
+                .wait()
+                .at_most(Duration::from_secs(10))
+                .for_element(Locator::Css(&css))
                 .await
-                .with_context(|| format!("Failed to find element by CSS '{css}'"))?,
+                .with_context(|| format!("Failed to find element by CSS '{css}'")),
             SelectorKind::XPath(xpath) => client
-                .find(Locator::XPath(&xpath))
+                .wait()
+                .at_most(Duration::from_secs(10))
+                .for_element(Locator::XPath(&xpath))
                 .await
-                .with_context(|| format!("Failed to find element by XPath '{xpath}'"))?,
-        };
-        Ok(element)
+                .with_context(|| format!("Failed to find element by XPath '{xpath}'")),
+        }
     }
 
     async fn hover_element(client: &Client, element: &fantoccini::elements::Element) -> Result<()> {
@@ -1779,7 +1804,7 @@ mod native_backend {
     }}
     for (const child of el.children) {{
       walk(child, depth + 1);
-      if (nodes.length >= 400) return;
+      if (nodes.length >= 800) return;
     }}
   }};
 
@@ -2012,6 +2037,8 @@ fn is_recoverable_rust_native_error(err: &anyhow::Error) -> bool {
         || message.contains("session not created")
         || message.contains("connection reset")
         || message.contains("broken pipe")
+        || message.contains("connection refused")
+        || message.contains("no such session")
     {
         return true;
     }
