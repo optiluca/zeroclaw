@@ -23,11 +23,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 # 1. Copy manifests to cache dependencies
 COPY Cargo.toml Cargo.lock ./
-# Include every workspace member: Cargo.lock is generated for the full workspace.
-# Previously we used sed to drop `crates/robot-kit`, which made the manifest disagree
-# with the lockfile and caused `cargo --locked` to fail (Cargo refused to rewrite the lock).
-COPY crates/robot-kit/ crates/robot-kit/
-COPY crates/aardvark-sys/ crates/aardvark-sys/
+# All workspace crates must be present so cargo can resolve the full workspace.
+# We copy all of crates/ so Cargo.toml + source are available for the dependency
+# pre-compilation step. The Docker layer cache is invalidated when crate source
+# changes, but the Cargo registry/git caches (via --mount) avoid re-downloading.
+COPY crates/ crates/
 # Include tauri workspace member manifest (desktop app, but needed for workspace resolution).
 # .dockerignore whitelists only Cargo.toml; src and build.rs are stubbed below.
 COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
