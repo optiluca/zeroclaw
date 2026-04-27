@@ -1531,6 +1531,14 @@ mod native_backend {
                 Value::String("eager".to_string()),
             );
 
+            // Selenium Grid 4 requires browserName to route the session to the
+            // correct node and to launch Chrome correctly; without it the Grid
+            // accepts the request but Chrome exits immediately on startup.
+            capabilities.insert(
+                "browserName".to_string(),
+                Value::String("chrome".to_string()),
+            );
+
             let mut builder =
                 ClientBuilder::rustls().context("Failed to initialize rustls connector")?;
             if !capabilities.is_empty() {
