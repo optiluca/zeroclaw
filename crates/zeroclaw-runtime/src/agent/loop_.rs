@@ -2311,6 +2311,10 @@ pub async fn run(
     ));
     if config.browser.enabled {
         tool_descs.push((
+            "browser",
+            "Full browser automation (navigate, click, fill, screenshot, snapshot). Use when: scraping, interacting with web UIs, or any task requiring a real browser session.",
+        ));
+        tool_descs.push((
             "browser_open",
             "Open approved HTTPS URLs in system browser (allowlist-only, no scraping)",
         ));
@@ -3214,6 +3218,7 @@ pub async fn process_message(
         ));
     }
     if config.browser.enabled {
+        tool_descs.push(("browser", "Full browser automation (navigate, click, fill, screenshot, snapshot)."));
         tool_descs.push(("browser_open", "Open approved URLs in browser."));
     }
     if config.composio.enabled {
