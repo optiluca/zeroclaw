@@ -1122,6 +1122,75 @@ mod native_backend {
     use std::net::{TcpStream, ToSocketAddrs};
     use std::time::Duration;
 
+    const REAL_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+    // Injected via CDP Page.addScriptToEvaluateOnNewDocument — runs before any page scripts.
+    // Patches the JS properties that Cloudflare / Akamai fingerprint to identify headless/automated browsers.
+    const STEALTH_JS: &str = r#"
+(function () {
+    // navigator.webdriver
+    try { Object.defineProperty(navigator, 'webdriver', { get: function() { return undefined; } }); } catch(_) {}
+
+    // window.chrome (missing entirely in headless and automation environments)
+    try {
+        if (!window.chrome) { window.chrome = {}; }
+        if (!window.chrome.runtime) {
+            window.chrome.runtime = {
+                onConnect: { addListener: function(){}, removeListener: function(){}, hasListener: function(){ return false; } },
+                onMessage: { addListener: function(){}, removeListener: function(){}, hasListener: function(){ return false; } },
+                connect: function(){ return { onMessage: { addListener: function(){} }, postMessage: function(){}, disconnect: function(){} }; },
+                sendMessage: function(){},
+                id: undefined
+            };
+        }
+        if (!window.chrome.loadTimes) { window.chrome.loadTimes = function(){ return {}; }; }
+        if (!window.chrome.csi) { window.chrome.csi = function(){ return { startE: Date.now(), onloadT: Date.now() + 50, pageT: 50, tran: 15 }; }; }
+        if (!window.chrome.app) { window.chrome.app = { isInstalled: false, getDetails: function(){ return null; }, getIsInstalled: function(){ return false; } }; }
+    } catch(_) {}
+
+    // navigator.plugins (empty array is a strong headless signal)
+    try {
+        if (navigator.plugins.length === 0) {
+            var mimeType = { type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format', enabledPlugin: null };
+            var plugin = { 0: mimeType, name: 'PDF Viewer', description: 'Portable Document Format', filename: 'internal-pdf-viewer', length: 1,
+                item: function(i) { return i === 0 ? mimeType : null; },
+                namedItem: function(n) { return n === 'application/pdf' ? mimeType : null; } };
+            Object.setPrototypeOf(plugin, Plugin.prototype);
+            mimeType.enabledPlugin = plugin;
+            var arr = [plugin];
+            Object.setPrototypeOf(arr, PluginArray.prototype);
+            Object.defineProperty(navigator, 'plugins', { get: function() { return arr; } });
+        }
+    } catch(_) {}
+
+    // navigator.languages
+    try {
+        Object.defineProperty(navigator, 'languages', { get: function() { return ['it-IT', 'it', 'en-US', 'en']; } });
+    } catch(_) {}
+
+    // Permissions API: 'notifications' returning 'denied' is a headless signal
+    try {
+        var origQuery = navigator.permissions.query.bind(navigator.permissions);
+        navigator.permissions.query = function(params) {
+            if (params && params.name === 'notifications') {
+                return Promise.resolve({ state: 'default', onchange: null });
+            }
+            return origQuery(params);
+        };
+    } catch(_) {}
+
+    // WebGL: SwiftShader vendor/renderer is a headless signal
+    try {
+        var origGetParam = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(p) {
+            if (p === 37445) return 'Intel Inc.';
+            if (p === 37446) return 'Intel Iris OpenGL Engine';
+            return origGetParam.call(this, p);
+        };
+    } catch(_) {}
+})();
+"#;
+
     #[derive(Default)]
     pub struct NativeBrowserState {
         client: Option<Client>,
@@ -1490,6 +1559,9 @@ mod native_backend {
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--password-store=basic",
+                // Prevent navigator.webdriver from being set to true via the Blink automation
+                // feature; Cloudflare and Akamai check this property to detect headless browsers.
+                "--disable-blink-features=AutomationControlled",
             ] {
                 args.push(Value::String((*flag).to_string()));
             }
@@ -1497,6 +1569,8 @@ mod native_backend {
             if headless {
                 args.push(Value::String("--headless=new".to_string()));
                 args.push(Value::String("--disable-gpu".to_string()));
+                // Override the HeadlessChrome user-agent string so sites don't trivially detect headless mode.
+                args.push(Value::String(format!("--user-agent={REAL_UA}")));
             }
 
             // When running as a service (systemd/OpenRC), the browser sandbox
@@ -1508,6 +1582,14 @@ mod native_backend {
             }
 
             chrome_options.insert("args".to_string(), Value::Array(args));
+
+            // Prevent ChromeDriver from injecting the --enable-automation switch and
+            // the automation extension — both are checked by anti-bot systems.
+            chrome_options.insert(
+                "excludeSwitches".to_string(),
+                json!(["enable-automation"]),
+            );
+            chrome_options.insert("useAutomationExtension".to_string(), Value::Bool(false));
 
             if let Some(path) = chrome_path {
                 let trimmed = path.trim();
@@ -1555,7 +1637,40 @@ mod native_backend {
                 })?;
 
             self.client = Some(client);
+            self.inject_stealth(webdriver_url).await;
             Ok(())
+        }
+
+        // Injects stealth patches into the Chrome session via CDP so they run before any page
+        // scripts on every subsequent navigation.  Failures are non-fatal — the session still
+        // works, it just has weaker anti-detection coverage.
+        async fn inject_stealth(&self, webdriver_url: &str) {
+            let client = match &self.client {
+                Some(c) => c,
+                None => return,
+            };
+
+            // Override the user-agent at the network level (defence-in-depth for headless mode).
+            let _ = client.set_ua(REAL_UA).await;
+
+            let sid = match client.session_id().await {
+                Ok(Some(s)) => s,
+                _ => return,
+            };
+
+            let cdp_url = format!(
+                "{}/session/{}/goog/cdp/execute",
+                webdriver_url.trim_end_matches('/'),
+                sid
+            );
+            let _ = reqwest::Client::new()
+                .post(&cdp_url)
+                .json(&json!({
+                    "cmd": "Page.addScriptToEvaluateOnNewDocument",
+                    "params": { "source": STEALTH_JS }
+                }))
+                .send()
+                .await;
         }
 
         fn active_client(&self) -> Result<&Client> {
